@@ -549,10 +549,10 @@ impl Account {
         }
     }
 
-    /// Can this account's tokenstate safely be restored from `act_dump`? Roughly
-    /// speaking, if `act_dump` was converted into an `Account`, would that new `Account` compare
-    /// equal with `secure_eq` to `self`? If `true`, then it is safe to restore `self`'s
-    /// tokenstate from `act_dump`.
+    /// Can this account's tokenstate safely be restored from `act_dump`?
+    /// Roughly speaking, if `act_dump` was converted into an `Account`,
+    /// would that new `Account` compare equal with `secure_eq` to `self`?
+    /// If `true`, then it is safe to restore the `self`'s tokenstate from `act_dump`.
     pub fn secure_restorable(&self, act_dump: &AccountDump) -> bool {
         self.auth_uri == act_dump.auth_uri
             && self.auth_uri_fields == act_dump.auth_uri_fields
