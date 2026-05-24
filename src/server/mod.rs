@@ -101,54 +101,52 @@ fn request(pstate: Arc<AuthenticatorState>, mut stream: UnixStream) -> Result<()
         (std::str::from_utf8(&buf[..len])?, &buf[len + 1..])
     };
 
-    match cmd {
-        "dump" if rest.is_empty() => {
-            stream.write_all(&pstate.dump()?)?;
-            return Ok(());
-        }
-        "info" if rest.is_empty() => {
-            let mut m = HashMap::new();
-            m.insert(
-                "http_port",
-                match pstate.http_port {
-                    Some(x) => x.to_string(),
-                    None => "none".to_string(),
-                },
-            );
-            m.insert(
-                "https_port",
-                match pstate.https_port {
-                    Some(x) => x.to_string(),
-                    None => "none".to_string(),
-                },
-            );
-            if let Some(x) = &pstate.https_pub_key {
-                m.insert("https_pub_key", x.clone());
+    'cmdSelector: {
+        match cmd {
+            "dump" if rest.is_empty() => {
+                stream.write_all(&pstate.dump()?)?;
+                return Ok(());
             }
-            stream.write_all(json!(m).to_string().as_bytes())?;
-            return Ok(());
-        }
-        "reload" if rest.is_empty() => {
-            match Config::from_path(&pstate.conf_path) {
-                Ok(new_conf) => {
-                    pstate.update_conf(new_conf);
-                    stream.write_all(b"ok:")?;
+            "info" if rest.is_empty() => {
+                let mut m = HashMap::new();
+                m.insert(
+                    "http_port",
+                    pstate
+                        .http_port
+                        .map_or_else(|| "none".to_string(), |x| x.to_string()),
+                );
+                m.insert(
+                    "https_port",
+                    pstate
+                        .https_port
+                        .map_or_else(|| "none".to_string(), |x| x.to_string()),
+                );
+                if let Some(x) = &pstate.https_pub_key {
+                    m.insert("https_pub_key", x.clone());
                 }
-                Err(e) => stream.write_all(format!("error:{e:}").as_bytes())?,
+                stream.write_all(json!(m).to_string().as_bytes())?;
+                return Ok(());
             }
-            return Ok(());
-        }
-        "refresh" => {
-            let rest = std::str::from_utf8(rest)?;
-            if let [with_url, act_name] = &rest.splitn(2, ' ').collect::<Vec<_>>()[..] {
-                let ct_lk = pstate.ct_lock();
-                let act_id = match ct_lk.validate_act_name(act_name) {
-                    Some(x) => x,
-                    None => {
-                        drop(ct_lk);
-                        stream.write_all(format!("error:No account '{act_name:}'").as_bytes())?;
-                        return Ok(());
+            "reload" if rest.is_empty() => {
+                match Config::from_path(&pstate.conf_path) {
+                    Ok(new_conf) => {
+                        pstate.update_conf(new_conf);
+                        stream.write_all(b"ok:")?;
                     }
+                    Err(e) => stream.write_all(format!("error:{e:}").as_bytes())?,
+                }
+                return Ok(());
+            }
+            "refresh" => {
+                let rest = std::str::from_utf8(rest)?;
+                let [with_url, act_name] = &rest.splitn(2, ' ').collect::<Vec<_>>()[..] else {
+                    break 'cmdSelector;
+                };
+                let ct_lk = pstate.ct_lock();
+                let Some(act_id) = ct_lk.validate_act_name(act_name) else {
+                    drop(ct_lk);
+                    stream.write_all(format!("error:No account '{act_name:}'").as_bytes())?;
+                    return Ok(());
                 };
                 match ct_lk.tokenstate(act_id) {
                     TokenState::Empty | TokenState::Pending { .. } => {
@@ -167,46 +165,42 @@ fn request(pstate: Arc<AuthenticatorState>, mut stream: UnixStream) -> Result<()
                 }
                 return Ok(());
             }
-        }
-        "restore" => {
-            match pstate.restore(rest.to_vec()) {
-                Ok(()) => stream.write_all(b"ok:")?,
-                Err(e) => stream.write_all(format!("error:{e:}").as_bytes())?,
-            }
-            return Ok(());
-        }
-        "revoke" => {
-            let act_name = std::str::from_utf8(rest)?;
-            let mut ct_lk = pstate.ct_lock();
-            match ct_lk.validate_act_name(act_name) {
-                Some(act_id) => {
-                    ct_lk.tokenstate_replace(act_id, TokenState::Empty);
-                    drop(ct_lk);
-
-                    pstate
-                        .eventer
-                        .token_event(act_name.to_owned(), TokenEvent::Revoked);
-                    stream.write_all(b"ok:")?;
-                    return Ok(());
+            "restore" => {
+                match pstate.restore(rest.to_vec()) {
+                    Ok(()) => stream.write_all(b"ok:")?,
+                    Err(e) => stream.write_all(format!("error:{e:}").as_bytes())?,
                 }
-                None => {
+                return Ok(());
+            }
+            "revoke" => {
+                let act_name = std::str::from_utf8(rest)?;
+                let mut ct_lk = pstate.ct_lock();
+                let Some(act_id) = ct_lk.validate_act_name(act_name) else {
                     drop(ct_lk);
                     stream.write_all(format!("error:No account '{act_name:}'").as_bytes())?;
                     return Ok(());
-                }
-            };
-        }
-        "showtoken" => {
-            let rest = std::str::from_utf8(rest)?;
-            if let [with_url, act_name] = &rest.splitn(2, ' ').collect::<Vec<_>>()[..] {
+                };
+
+                ct_lk.tokenstate_replace(act_id, TokenState::Empty);
+                drop(ct_lk);
+
+                pstate
+                    .eventer
+                    .token_event(act_name.to_owned(), TokenEvent::Revoked);
+                stream.write_all(b"ok:")?;
+
+                return Ok(());
+            }
+            "showtoken" => {
+                let rest = std::str::from_utf8(rest)?;
+                let [with_url, act_name] = &rest.splitn(2, ' ').collect::<Vec<_>>()[..] else {
+                    break 'cmdSelector;
+                };
                 let ct_lk = pstate.ct_lock();
-                let act_id = match ct_lk.validate_act_name(act_name) {
-                    Some(x) => x,
-                    None => {
-                        drop(ct_lk);
-                        stream.write_all(format!("error:No account '{act_name:}'").as_bytes())?;
-                        return Ok(());
-                    }
+                let Some(act_id) = ct_lk.validate_act_name(act_name) else {
+                    drop(ct_lk);
+                    stream.write_all(format!("error:No account '{act_name:}'").as_bytes())?;
+                    return Ok(());
                 };
                 match ct_lk.tokenstate(act_id) {
                     TokenState::Empty => {
@@ -236,7 +230,7 @@ fn request(pstate: Arc<AuthenticatorState>, mut stream: UnixStream) -> Result<()
                             format!("access_token:{access_token:}")
                         } else if *ongoing_refresh {
                             "error:Access token has expired. Refreshing is in progress but has not yet succeeded"
-                                .into()
+                            .into()
                         } else {
                             pstate.refresher.sched_refresh(Arc::clone(&pstate), act_id);
                             "error:Access token has expired. Refreshing initiated".into()
@@ -247,62 +241,62 @@ fn request(pstate: Arc<AuthenticatorState>, mut stream: UnixStream) -> Result<()
                 }
                 return Ok(());
             }
-        }
-        "shutdown" if rest.is_empty() => {
-            raise(Signal::SIGTERM).ok();
-            return Ok(());
-        }
-        "status" if rest.is_empty() => {
-            let ct_lk = pstate.ct_lock();
-            let mut acts = Vec::new();
-            for act_id in ct_lk.act_ids() {
-                let act = ct_lk.account(act_id);
-                let st = match ct_lk.tokenstate(act_id) {
-                    TokenState::Empty => "No access token".into(),
-                    TokenState::Pending {
-                        last_notification: Some(i),
-                        ..
-                    } => format!(
-                        "Access token pending authentication (last notification {})",
-                        instant_fmt(*i)
-                    ),
-                    TokenState::Pending {
-                        last_notification: None,
-                        ..
-                    } => "Access token pending authentication".into(),
-                    TokenState::Active {
-                        access_token_obtained,
-                        access_token_expiry,
-                        last_refresh_attempt,
-                        ..
-                    } => {
-                        if *access_token_expiry > Instant::now() {
-                            format!(
-                                "Active access token (obtained {}; expires {})",
-                                instant_fmt(*access_token_obtained),
-                                instant_fmt(*access_token_expiry)
-                            )
-                        } else if let Some(i) = last_refresh_attempt {
-                            format!(
-                                "Access token expired (last refresh attempt {})",
-                                instant_fmt(*i)
-                            )
-                        } else {
-                            "Access token expired (refresh not yet attempted)".into()
+            "shutdown" if rest.is_empty() => {
+                raise(Signal::SIGTERM).ok();
+                return Ok(());
+            }
+            "status" if rest.is_empty() => {
+                let ct_lk = pstate.ct_lock();
+                let mut acts = Vec::new();
+                for act_id in ct_lk.act_ids() {
+                    let act = ct_lk.account(act_id);
+                    let st = match ct_lk.tokenstate(act_id) {
+                        TokenState::Empty => "No access token".into(),
+                        TokenState::Pending {
+                            last_notification: Some(i),
+                            ..
+                        } => format!(
+                            "Access token pending authentication (last notification {})",
+                            instant_fmt(*i)
+                        ),
+                        TokenState::Pending {
+                            last_notification: None,
+                            ..
+                        } => "Access token pending authentication".into(),
+                        TokenState::Active {
+                            access_token_obtained,
+                            access_token_expiry,
+                            last_refresh_attempt,
+                            ..
+                        } => {
+                            if *access_token_expiry > Instant::now() {
+                                format!(
+                                    "Active access token (obtained {}; expires {})",
+                                    instant_fmt(*access_token_obtained),
+                                    instant_fmt(*access_token_expiry)
+                                )
+                            } else if let Some(i) = last_refresh_attempt {
+                                format!(
+                                    "Access token expired (last refresh attempt {})",
+                                    instant_fmt(*i)
+                                )
+                            } else {
+                                "Access token expired (refresh not yet attempted)".into()
+                            }
                         }
-                    }
-                };
-                acts.push(format!("{}: {st}", act.name));
+                    };
+                    acts.push(format!("{}: {st}", act.name));
+                }
+                acts.sort();
+                if acts.is_empty() {
+                    stream.write_all(b"error:No accounts configured")?;
+                } else {
+                    stream.write_all(format!("ok:{}", acts.join("\n")).as_bytes())?;
+                }
+                return Ok(());
             }
-            acts.sort();
-            if acts.is_empty() {
-                stream.write_all(b"error:No accounts configured")?;
-            } else {
-                stream.write_all(format!("ok:{}", acts.join("\n")).as_bytes())?;
-            }
-            return Ok(());
+            x => stream.write_all(format!("error:Unknown command '{x}'").as_bytes())?,
         }
-        x => stream.write_all(format!("error:Unknown command '{x}'").as_bytes())?,
     }
     Err("Invalid command".into())
 }

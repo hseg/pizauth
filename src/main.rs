@@ -47,13 +47,14 @@ const PIZAUTH_CACHE_SOCK_LEAF: &str = "pizauth.sock";
 const PIZAUTH_CONF_LEAF: &str = "pizauth.conf";
 
 fn progname() -> String {
-    match current_exe() {
-        Ok(p) => p
-            .file_name()
-            .map_or("pizauth", |x| x.to_str().unwrap_or("pizauth"))
-            .to_owned(),
-        Err(_) => "pizauth".to_owned(),
-    }
+    current_exe().map_or_else(
+        |_| "pizauth".to_owned(),
+        |p| {
+            p.file_name()
+                .map_or("pizauth", |x| x.to_str().unwrap_or("pizauth"))
+                .to_owned()
+        },
+    )
 }
 
 /// Exit with a fatal error: only to be called before the log crate is setup.
@@ -73,15 +74,14 @@ fn usage() -> ! {
 
 fn cache_path() -> PathBuf {
     let mut p = PathBuf::new();
-    match env::var_os("XDG_RUNTIME_DIR") {
-        Some(s) => p.push(s),
-        None => {
-            p.push(env::var_os("TMPDIR").unwrap_or_else(|| OsString::from("/tmp")));
-            p.push(format!(
-                "runtime-{}",
-                username().unwrap_or_else(|_| "unknown-user".to_owned())
-            ));
-        }
+    if let Some(s) = env::var_os("XDG_RUNTIME_DIR") {
+        p.push(s)
+    } else {
+        p.push(env::var_os("TMPDIR").unwrap_or_else(|| OsString::from("/tmp")));
+        p.push(format!(
+            "runtime-{}",
+            username().unwrap_or_else(|_| "unknown-user".to_owned())
+        ));
     }
 
     let md = |p: &PathBuf| {
@@ -105,9 +105,8 @@ fn cache_path() -> PathBuf {
 }
 
 fn conf_path(matches: &getopts::Matches) -> PathBuf {
-    match matches.opt_str("c") {
-        Some(p) => PathBuf::from(&p),
-        None => {
+    matches.opt_str("c").map_or_else(
+        || {
             let mut p = PathBuf::new();
             match env::var_os("XDG_CONFIG_HOME") {
                 Some(s) => p.push(s),
@@ -127,8 +126,9 @@ fn conf_path(matches: &getopts::Matches) -> PathBuf {
                 ));
             }
             p
-        }
-    }
+        },
+        |p| PathBuf::from(&p),
+    )
 }
 
 fn main() {
@@ -198,10 +198,10 @@ fn main() {
                     "info_format_version": 2,
                     "pizauth_version": ver
                 });
-                let svj = match svj {
-                    Some(x) => json!({ "server_running": true, "server_info": x}),
-                    None => json!({ "server_running": false }),
-                };
+                let svj = svj.map_or_else(
+                    || json!({ "server_running": false }),
+                    |x| json!({ "server_running": true, "server_info": x}),
+                );
                 j.as_object_mut()
                     .unwrap()
                     .extend(svj.as_object().unwrap().clone());

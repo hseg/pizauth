@@ -84,72 +84,67 @@ impl Refresher {
                             }
                             RefreshKind::TransitoryError(act_id, msg) => {
                                 ct_lk = pstate.ct_lock();
-                                if ct_lk.is_act_id_valid(act_id) {
+                                'transitoryError: {
+                                    if !ct_lk.is_act_id_valid(act_id) {
+                                        drop(ct_lk);
+                                        break 'transitoryError;
+                                    }
                                     let mut new_ts = ct_lk.tokenstate(act_id).clone();
-                                    if let TokenState::Active {
+                                    let TokenState::Active {
                                         ref mut last_refresh_attempt,
                                         ref mut consecutive_refresh_fails,
                                         ..
                                     } = new_ts
-                                    {
-                                        *last_refresh_attempt = Some(Instant::now());
-                                        *consecutive_refresh_fails += 1;
-                                        let consecutive_refresh_fails = *consecutive_refresh_fails;
-                                        let act_id = ct_lk.tokenstate_replace(act_id, new_ts);
-                                        if consecutive_refresh_fails
-                                            .rem_euclid(TRANSIENT_ERROR_RETRIES)
-                                            == 0
-                                        {
-                                            if let Some(ref cmd) =
-                                                ct_lk.config().transient_error_if_cmd
-                                            {
-                                                let cmd = cmd.to_owned();
-                                                drop(ct_lk);
-                                                match shell_cmd(
-                                                    &cmd,
-                                                    [("PIZAUTH_ACCOUNT", act_name.as_str())],
-                                                    TRANSIENT_ERROR_IF_CMD_TIMEOUT,
-                                                ) {
-                                                    Ok(()) => {
-                                                        ct_lk = pstate.ct_lock();
-                                                        if ct_lk.is_act_id_valid(act_id) {
-                                                            ct_lk.tokenstate_set_ongoing_refresh(
-                                                                act_id, false,
-                                                            );
-                                                        }
-                                                        drop(ct_lk);
-                                                    }
-                                                    Err(e) => {
-                                                        ct_lk = pstate.ct_lock();
-                                                        if ct_lk.is_act_id_valid(act_id) {
-                                                            ct_lk.tokenstate_replace(
-                                                                act_id,
-                                                                TokenState::Empty,
-                                                            );
-                                                        }
-                                                        drop(ct_lk);
-                                                        error!("Permanent refresh error for {act_name}: {e}");
-                                                        pstate.eventer.token_event(
-                                                            act_name,
-                                                            TokenEvent::Invalidated,
-                                                        );
-                                                    }
-                                                };
-                                            } else {
-                                                ct_lk.tokenstate_set_ongoing_refresh(act_id, false);
-                                                drop(ct_lk);
-                                                info!("Transitory refresh error for {act_name}: {msg}");
-                                            }
-                                        } else {
-                                            ct_lk.tokenstate_set_ongoing_refresh(act_id, false);
-                                            drop(ct_lk);
-                                            info!("Transitory refresh error for {act_name}: {msg}");
-                                        }
-                                    } else {
+                                    else {
                                         unreachable!();
+                                        #[allow(unreachable_code)]
+                                        break 'transitoryError;
+                                    };
+                                    *last_refresh_attempt = Some(Instant::now());
+                                    *consecutive_refresh_fails += 1;
+                                    let consecutive_refresh_fails = *consecutive_refresh_fails;
+                                    let act_id = ct_lk.tokenstate_replace(act_id, new_ts);
+                                    if consecutive_refresh_fails.rem_euclid(TRANSIENT_ERROR_RETRIES)
+                                        != 0
+                                    {
+                                        ct_lk.tokenstate_set_ongoing_refresh(act_id, false);
+                                        drop(ct_lk);
+                                        info!("Transitory refresh error for {act_name}: {msg}");
+                                        break 'transitoryError;
                                     }
-                                } else {
+                                    let Some(ref cmd) = ct_lk.config().transient_error_if_cmd
+                                    else {
+                                        ct_lk.tokenstate_set_ongoing_refresh(act_id, false);
+                                        drop(ct_lk);
+                                        info!("Transitory refresh error for {act_name}: {msg}");
+                                        break 'transitoryError;
+                                    };
+                                    let cmd = cmd.to_owned();
                                     drop(ct_lk);
+                                    match shell_cmd(
+                                        &cmd,
+                                        [("PIZAUTH_ACCOUNT", act_name.as_str())],
+                                        TRANSIENT_ERROR_IF_CMD_TIMEOUT,
+                                    ) {
+                                        Ok(()) => {
+                                            ct_lk = pstate.ct_lock();
+                                            if ct_lk.is_act_id_valid(act_id) {
+                                                ct_lk.tokenstate_set_ongoing_refresh(act_id, false);
+                                            }
+                                            drop(ct_lk);
+                                        }
+                                        Err(e) => {
+                                            ct_lk = pstate.ct_lock();
+                                            if ct_lk.is_act_id_valid(act_id) {
+                                                ct_lk.tokenstate_replace(act_id, TokenState::Empty);
+                                            }
+                                            drop(ct_lk);
+                                            error!("Permanent refresh error for {act_name}: {e}");
+                                            pstate
+                                                .eventer
+                                                .token_event(act_name, TokenEvent::Invalidated);
+                                        }
+                                    };
                                 }
                                 // If the main refresher thread noticed we were running it
                                 // might have given up, so give it a chance to recalculate when
@@ -183,18 +178,16 @@ impl Refresher {
                 ref refresh_token,
                 ref mut last_refresh_attempt,
                 ..
-            } => match refresh_token {
-                Some(r) => {
-                    *last_refresh_attempt = Some(Instant::now());
-                    let r = r.to_owned();
-                    act_id = ct_lk.tokenstate_replace(act_id, new_ts);
-                    r
-                }
-                None => {
+            } => {
+                let Some(r) = refresh_token else {
                     ct_lk.tokenstate_replace(act_id, TokenState::Empty);
                     return RefreshKind::NoRefreshToken;
-                }
-            },
+                };
+                *last_refresh_attempt = Some(Instant::now());
+                let r = r.to_owned();
+                act_id = ct_lk.tokenstate_replace(act_id, new_ts);
+                r
+            }
             _ => unreachable!("tokenstate is not TokenState::Active"),
         };
 
@@ -281,54 +274,52 @@ impl Refresher {
             }
         };
 
-        match (
+        let (Some(access_token), Some(expires_in), Some("Bearer")) = (
             parsed["access_token"].as_str(),
             parsed["expires_in"].as_u64(),
             parsed["token_type"].as_str(),
-        ) {
-            (Some(access_token), Some(expires_in), Some("Bearer")) => {
-                let refresh_token = match parsed.get("refresh_token") {
-                    None => Some(refresh_token),
-                    Some(Value::String(x)) => Some(x.to_owned()),
-                    Some(_) => None,
-                };
-                let now = Instant::now();
-                let mut ct_lk = pstate.ct_lock();
-                if ct_lk.is_act_id_valid(act_id) {
-                    let expiry = match expiry_instant(&ct_lk, act_id, now, expires_in) {
-                        Ok(x) => x,
-                        Err(e) => {
-                            ct_lk.tokenstate_replace(act_id, TokenState::Empty);
-                            return RefreshKind::PermanentError(format!("{e}"));
-                        }
-                    };
-                    ct_lk.tokenstate_replace(
-                        act_id,
-                        TokenState::Active {
-                            access_token: access_token.to_owned(),
-                            access_token_obtained: now,
-                            access_token_expiry: expiry,
-                            ongoing_refresh: false,
-                            consecutive_refresh_fails: 0,
-                            last_refresh_attempt: None,
-                            refresh_token,
-                        },
-                    );
-                    drop(ct_lk);
-                    RefreshKind::Refreshed
-                } else {
-                    RefreshKind::AccountOrTokenStateChanged
-                }
+        ) else {
+            let mut ct_lk = pstate.ct_lock();
+            if ct_lk.is_act_id_valid(act_id) {
+                ct_lk.tokenstate_replace(act_id, TokenState::Empty);
+                return RefreshKind::PermanentError(
+                    "Received JSON in unexpected format".to_string(),
+                );
+            } else {
+                return RefreshKind::AccountOrTokenStateChanged;
             }
-            _ => {
-                let mut ct_lk = pstate.ct_lock();
-                if ct_lk.is_act_id_valid(act_id) {
+        };
+        let refresh_token = match parsed.get("refresh_token") {
+            None => Some(refresh_token),
+            Some(Value::String(x)) => Some(x.to_owned()),
+            Some(_) => None,
+        };
+        let now = Instant::now();
+        let mut ct_lk = pstate.ct_lock();
+        if ct_lk.is_act_id_valid(act_id) {
+            let expiry = match expiry_instant(&ct_lk, act_id, now, expires_in) {
+                Ok(x) => x,
+                Err(e) => {
                     ct_lk.tokenstate_replace(act_id, TokenState::Empty);
-                    RefreshKind::PermanentError("Received JSON in unexpected format".to_string())
-                } else {
-                    RefreshKind::AccountOrTokenStateChanged
+                    return RefreshKind::PermanentError(format!("{e}"));
                 }
-            }
+            };
+            ct_lk.tokenstate_replace(
+                act_id,
+                TokenState::Active {
+                    access_token: access_token.to_owned(),
+                    access_token_obtained: now,
+                    access_token_expiry: expiry,
+                    ongoing_refresh: false,
+                    consecutive_refresh_fails: 0,
+                    last_refresh_attempt: None,
+                    refresh_token,
+                },
+            );
+            drop(ct_lk);
+            RefreshKind::Refreshed
+        } else {
+            RefreshKind::AccountOrTokenStateChanged
         }
     }
 
@@ -384,12 +375,11 @@ impl Refresher {
             .act_ids()
             .filter_map(|act_id| self.refresh_at(pstate, &ct_lk, act_id))
             .min()
-            .map(
-                |act_min| match Instant::now().checked_add(Duration::from_secs(MAX_WAIT_SECS)) {
-                    Some(x) => cmp::min(act_min, x),
-                    None => act_min,
-                },
-            )
+            .map(|act_min| {
+                Instant::now()
+                    .checked_add(Duration::from_secs(MAX_WAIT_SECS))
+                    .map_or(act_min, |x| cmp::min(act_min, x))
+            })
     }
 
     /// Notify the refresher that one or more [`TokenState`]s is likely to have changed in a way that
@@ -410,21 +400,18 @@ impl Refresher {
             let next_wakeup = refresher.next_wakeup(&pstate);
             let mut refresh_lk = refresher.pred.lock().unwrap();
             while !*refresh_lk {
-                match next_wakeup {
-                    Some(t) => match t.checked_duration_since(Instant::now()) {
-                        Some(d) => {
-                            #[cfg(debug_assertions)]
-                            debug!("Refresher: next wakeup {}", d.as_secs());
-                            refresh_lk = refresher.condvar.wait_timeout(refresh_lk, d).unwrap().0;
-                        }
-                        None => break,
-                    },
-                    None => {
-                        #[cfg(debug_assertions)]
-                        debug!("Refresher: next wakeup <indefinite>");
-                        refresh_lk = refresher.condvar.wait(refresh_lk).unwrap();
-                    }
-                }
+                let Some(t) = next_wakeup else {
+                    #[cfg(debug_assertions)]
+                    debug!("Refresher: next wakeup <indefinite>");
+                    refresh_lk = refresher.condvar.wait(refresh_lk).unwrap();
+                    continue;
+                };
+                let Some(d) = t.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                #[cfg(debug_assertions)]
+                debug!("Refresher: next wakeup {}", d.as_secs());
+                refresh_lk = refresher.condvar.wait_timeout(refresh_lk, d).unwrap().0;
             }
 
             *refresh_lk = false;
@@ -434,12 +421,11 @@ impl Refresher {
             let now = Instant::now();
             let to_refresh = ct_lk
                 .act_ids()
-                .filter(
-                    |act_id| match refresher.refresh_at(&pstate, &ct_lk, *act_id) {
-                        Some(t) => t <= now,
-                        None => false,
-                    },
-                )
+                .filter(|act_id| {
+                    refresher
+                        .refresh_at(&pstate, &ct_lk, *act_id)
+                        .is_some_and(|t| t <= now)
+                })
                 .collect::<HashSet<_>>();
             drop(ct_lk);
 

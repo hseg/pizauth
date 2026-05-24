@@ -45,37 +45,32 @@ fn request<T: Read + Write>(
     // there's no effect on the tokenstate. In the second half we make a request to an OAuth
     // server: if there's a problem, we have to reset the tokenstate and force the user to make an
     // entirely fresh request.
-    let uri = match parse_get(&mut stream, is_https) {
-        Ok(x) => x,
-        Err(_) => {
-            // If someone couldn't even be bothered giving us a valid URI, it's unlikely this was a
-            // genuine request that's worth reporting as an error.
-            http_400(stream);
-            return Ok(());
-        }
+    let Ok(uri) = parse_get(&mut stream, is_https) else {
+        // If someone couldn't even be bothered giving us a valid URI, it's unlikely this was a
+        // genuine request that's worth reporting as an error.
+        http_400(stream);
+        return Ok(());
     };
 
     // All valid requests (even those reporting an error!) should report back a valid "state" to
     // us, so fish that out of the URI and check that it matches a request we made.
-    let state = match uri.query_pairs().find(|(k, _)| k == "state") {
-        Some((_, state)) => state.into_owned(),
-        None => {
-            // As well as malformed OAuth queries this will also 404 for favicon.ico.
-            http_404(stream);
-            return Ok(());
-        }
+    let Some(state) = uri
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, state)| state.into_owned())
+    else {
+        // As well as malformed OAuth queries this will also 404 for favicon.ico.
+        http_404(stream);
+        return Ok(());
     };
     let mut ct_lk = pstate.ct_lock();
-    let act_id = match ct_lk.act_id_matching_token_state(&state) {
-        Some(x) => x,
-        None => {
-            drop(ct_lk);
-            http_200(
-                stream,
-                "No pending token matches request state: request a fresh token",
-            );
-            return Ok(());
-        }
+    let Some(act_id) = ct_lk.act_id_matching_token_state(&state) else {
+        drop(ct_lk);
+        http_200(
+            stream,
+            "No pending token matches request state: request a fresh token",
+        );
+        return Ok(());
     };
 
     // Now that we know which account has been matched we can check if the full URI requested
@@ -105,15 +100,16 @@ fn request<T: Read + Write>(
     }
 
     // Fish out the code query.
-    let code = match uri.query_pairs().find(|(k, _)| k == "code") {
-        Some((_, code)) => code.to_string(),
-        None => {
-            // A request without a 'code' is broken. This seems very unlikely to happen and if it
-            // does, would retrying our request from scratch improve anything?
-            drop(ct_lk);
-            http_400(stream);
-            return Ok(());
-        }
+    let Some(code) = uri
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, code)| code.to_string())
+    else {
+        // A request without a 'code' is broken. This seems very unlikely to happen and if it
+        // does, would retrying our request from scratch improve anything?
+        drop(ct_lk);
+        http_400(stream);
+        return Ok(());
     };
 
     let code_verifier = match ct_lk.tokenstate(act_id) {
@@ -173,12 +169,9 @@ fn request<T: Read + Write>(
         }
         thread::sleep(Duration::from_secs(RETRY_DELAY));
     }
-    let body = match body {
-        Some(x) => x,
-        None => {
-            fail(pstate, act_id, &format!("couldn't connect to {token_uri:}"))?;
-            return Ok(());
-        }
+    let Some(body) = body else {
+        fail(pstate, act_id, &format!("couldn't connect to {token_uri:}"))?;
+        return Ok(());
     };
 
     let parsed = match serde_json::from_str::<Value>(&body) {
@@ -200,37 +193,36 @@ fn request<T: Read + Write>(
         return Ok(());
     }
 
-    match (
+    let (Some("Bearer"), Some(expires_in), Some(access_token), refresh_token) = (
         parsed["token_type"].as_str(),
         parsed["expires_in"].as_u64(),
         parsed["access_token"].as_str(),
         parsed["refresh_token"].as_str(),
-    ) {
-        (Some("Bearer"), Some(expires_in), Some(access_token), refresh_token) => {
-            let now = Instant::now();
-            let expiry = expiry_instant(&ct_lk, act_id, now, expires_in)?;
-            let act_name = ct_lk.account(act_id).name.clone();
-            ct_lk.tokenstate_replace(
-                act_id,
-                TokenState::Active {
-                    access_token: access_token.to_owned(),
-                    access_token_obtained: now,
-                    access_token_expiry: expiry,
-                    ongoing_refresh: false,
-                    consecutive_refresh_fails: 0,
-                    last_refresh_attempt: None,
-                    refresh_token: refresh_token.map(|x| x.to_owned()),
-                },
-            );
-            drop(ct_lk);
-            pstate.refresher.notify_changes();
-            pstate.eventer.token_event(act_name, TokenEvent::New);
-        }
-        _ => {
-            drop(ct_lk);
-            fail(pstate, act_id, "invalid response received")?;
-        }
-    }
+    ) else {
+        drop(ct_lk);
+        fail(pstate, act_id, "invalid response received")?;
+        return Ok(());
+    };
+
+    let now = Instant::now();
+    let expiry = expiry_instant(&ct_lk, act_id, now, expires_in)?;
+    let act_name = ct_lk.account(act_id).name.to_owned();
+    ct_lk.tokenstate_replace(
+        act_id,
+        TokenState::Active {
+            access_token: access_token.to_owned(),
+            access_token_obtained: now,
+            access_token_expiry: expiry,
+            ongoing_refresh: false,
+            consecutive_refresh_fails: 0,
+            last_refresh_attempt: None,
+            refresh_token: refresh_token.map(|x| x.to_owned()),
+        },
+    );
+    drop(ct_lk);
+    pstate.refresher.notify_changes();
+    pstate.eventer.token_event(act_name, TokenEvent::New);
+
     Ok(())
 }
 
@@ -334,14 +326,16 @@ fn parse_get<T: Read + Write>(stream: &mut T, is_https: bool) -> Result<Url, Box
 
     // If host is Some, use addressed port to select scheme (http / https)
     // This works, as no HTTPS request will arrive until here on the HTTP port and vice versa
-    match host {
-        Some(h) => Url::parse(&format!(
-            "{}://{h:}{path:}",
-            if is_https { "https" } else { "http" }
-        ))
-        .map_err(|e| format!("Invalid request URI: {e:}").into()),
-        None => Err("No host field specified in HTTP request".into()),
-    }
+    host.map_or_else(
+        || Err("No host field specified in HTTP request".into()),
+        |h| {
+            Url::parse(&format!(
+                "{}://{h:}{path:}",
+                if is_https { "https" } else { "http" }
+            ))
+            .map_err(|e| format!("Invalid request URI: {e:}").into())
+        },
+    )
 }
 
 fn http_200<T: Read + Write>(mut stream: T, body: &str) {

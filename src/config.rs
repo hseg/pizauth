@@ -341,14 +341,16 @@ fn check_assigned<T>(
     span: Span,
     v: Option<T>,
 ) -> Result<T, String> {
-    match v {
-        Some(x) => Ok(x),
-        None => Err(error_at_span(
-            lexer,
-            span,
-            &format!("{name:} not specified"),
-        )),
-    }
+    v.map_or_else(
+        || {
+            Err(error_at_span(
+                lexer,
+                span,
+                &format!("{name:} not specified"),
+            ))
+        },
+        |x| Ok(x),
+    )
 }
 
 /// If you add to the, or alter the semantics of any existing, fields in this struct, you *must*

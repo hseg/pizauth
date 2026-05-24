@@ -42,21 +42,18 @@ impl Notifier {
             let next_wakeup = self.next_wakeup(&pstate);
             let mut notify_lk = self.pred.lock().unwrap();
             while !*notify_lk {
-                match next_wakeup {
-                    Some(t) => match t.checked_duration_since(Instant::now()) {
-                        Some(d) => {
-                            #[cfg(debug_assertions)]
-                            debug!("Notifier: next wakeup {}", d.as_secs());
-                            notify_lk = self.condvar.wait_timeout(notify_lk, d).unwrap().0;
-                        }
-                        None => break,
-                    },
-                    None => {
-                        #[cfg(debug_assertions)]
-                        debug!("Notifier: next wakeup <indefinite>");
-                        notify_lk = self.condvar.wait(notify_lk).unwrap();
-                    }
-                }
+                let Some(t) = next_wakeup else {
+                    #[cfg(debug_assertions)]
+                    debug!("Notifier: next wakeup <indefinite>");
+                    notify_lk = self.condvar.wait(notify_lk).unwrap();
+                    continue;
+                };
+                let Some(d) = t.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                #[cfg(debug_assertions)]
+                debug!("Notifier: next wakeup {}", d.as_secs());
+                notify_lk = self.condvar.wait_timeout(notify_lk, d).unwrap().0;
             }
             *notify_lk = false;
             drop(notify_lk);
@@ -120,12 +117,11 @@ impl Notifier {
             .act_ids()
             .filter_map(|act_id| notify_at(pstate, &ct_lk, act_id))
             .min()
-            .map(
-                |act_min| match Instant::now().checked_add(Duration::from_secs(MAX_WAIT_SECS)) {
-                    Some(x) => cmp::min(act_min, x),
-                    None => act_min,
-                },
-            )
+            .map(|act_min| {
+                Instant::now()
+                    .checked_add(Duration::from_secs(MAX_WAIT_SECS))
+                    .map_or(act_min, |x| cmp::min(act_min, x))
+            })
     }
 
     pub fn notify_error(
@@ -161,14 +157,12 @@ fn notify_at(_pstate: &AuthenticatorState, ct_lk: &CTGuard, act_id: AccountId) -
         TokenState::Pending {
             last_notification, ..
         } => {
-            match last_notification {
-                None => Some(Instant::now()),
-                Some(t) => {
-                    // There is no concept of Instant::MAX, so if `refreshed_at + d` exceeds
-                    // Instant's bounds, there's nothing we can fall back on.
-                    t.checked_add(ct_lk.config().auth_notify_interval)
-                }
-            }
+            last_notification.map_or_else(
+                || Some(Instant::now()),
+                // There is no concept of Instant::MAX, so if `refreshed_at + d` exceeds
+                // Instant's bounds, there's nothing we can fall back on.
+                |t| t.checked_add(ct_lk.config().auth_notify_interval),
+            )
         }
         _ => None,
     }

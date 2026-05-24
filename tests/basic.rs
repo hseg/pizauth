@@ -271,10 +271,10 @@ fn http_get(url: &Url) -> HttpResponse {
     let host = url.host_str().unwrap();
     let port = url.port_or_known_default().unwrap();
     let mut stream = TcpStream::connect((host, port)).unwrap();
-    let target = match url.query() {
-        Some(query) => format!("{}?{}", url.path(), query),
-        None => url.path().to_owned(),
-    };
+    let target = url.query().map_or_else(
+        || url.path().to_owned(),
+        |query| format!("{}?{}", url.path(), query),
+    );
     write!(
         stream,
         "GET {target} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
